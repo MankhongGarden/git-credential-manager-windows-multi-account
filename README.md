@@ -153,7 +153,9 @@ This tells GCM to key cached credentials by **host + full repo path**, not just 
 - `https://github.com/personal/side-project.git` gets a separate slot.
 - GCM stops asking which account to use.
 
-You will need to re-authenticate each repo once after enabling the flag, because the previous credential entry no longer matches the new key shape. After that single round of re-auth, you never see the picker again.
+You will need to re-authenticate each repo once after enabling the flag, because the previous credential entry no longer matches the new key shape. After that, the picker stops for repos that already have a slot.
+
+The trade-off: "once per repo" applies to **every repo you add later**, too. A repo that has never been pushed from this machine has no credential slot yet, so its first push must be able to show a GCM login. In a normal terminal that is a one-time browser sign-in. In a shell where prompts are disabled (CI, scripts, AI coding agents — see below) it fails immediately, even though other repos on the same machine push fine. With the flag on, `cmdkey /list` shows one entry per repo (`git:https://github.com/<owner>/<repo>.git`) instead of a single `git:https://github.com` entry.
 
 ---
 
@@ -233,6 +235,47 @@ If you forgot to set it and committed under the wrong email, you can rewrite the
 
 ---
 
+## Pushing from an AI agent's shell (updated 2026-10)
+
+AI coding agents that run shell commands for you (and the "run this command" escape hatch some of them offer) usually start that shell non-interactive, with:
+
+```
+GIT_TERMINAL_PROMPT=0
+GCM_INTERACTIVE=never
+```
+
+So Git cannot ask for a username in the terminal, and GCM is not allowed to open its sign-in UI. If a valid credential is already cached for the URL, `git push` works. If not, it fails fast with one of:
+
+```
+fatal: could not read Username for 'https://github.com': terminal prompts disabled
+fatal: Cannot prompt because user interactivity has been disabled.
+```
+
+This is **not** an expired or broken credential. Combined with `useHttpPath true`, it means: repos you have pushed before work from the agent; a brand-new repo or fresh fork fails until it has been signed in once.
+
+**Fix 1: sign in once interactively.** In your own terminal (not the agent's shell), push the new repo once so GCM can show its browser login:
+
+```powershell
+git -C <path-to-repo> push origin <branch>
+```
+
+After that, plain `git push` from the agent's shell works for that repo.
+
+**Fix 2: push without GCM, using a token for one command.** If you keep a fine-grained or classic PAT in an environment variable (here called `$env:MY_GITHUB_PAT` as a placeholder), you can bypass the credential helper for a single push and send the token as an HTTP header:
+
+```powershell
+$b = [Convert]::ToBase64String([Text.Encoding]::ASCII.GetBytes("x-access-token:$env:MY_GITHUB_PAT"))
+git -c credential.helper= -c "http.extraHeader=Authorization: Basic $b" push origin <branch>
+```
+
+- `-c credential.helper=` disables every configured helper for this one command, so GCM is not invoked (and cannot crash or hang).
+- The header is passed on the command line only; nothing is written to `.git/config`, and `git remote -v` stays clean (unlike Bad option 2 above).
+- It is still a secret on a command line: don't echo `$b`, and don't paste the command with the expanded value into logs or issues.
+
+Prefer Fix 1 when you can: it keeps the token out of the agent's hands entirely.
+
+---
+
 ## Cheatsheet
 
 Diagnostic order on a sick machine:
@@ -255,6 +298,9 @@ git config --global credential.https://github.com.useHttpPath true
 
 # 5. Authorship per repo (run in each clone)
 git config user.email "<correct-email-for-this-repo>"
+
+# 6. Prompts disabled in this shell? (agent / CI)
+$env:GIT_TERMINAL_PROMPT; $env:GCM_INTERACTIVE
 ```
 
 Fix the dual-helper:
@@ -279,6 +325,7 @@ Recover a PAT:
 4. Multi-account: `git config --global credential.https://github.com.useHttpPath true` keys credentials per-repo.
 5. Wrong-author commits = `user.email` problem, not credential problem. GitHub maps commits by email, not by PAT.
 6. PAT recovery: `git credential fill` instead of reading the Vault directly.
+7. Push fails instantly from an AI agent's shell on a new repo? Prompts are disabled (`GIT_TERMINAL_PROMPT=0`, `GCM_INTERACTIVE=never`) and `useHttpPath` means that repo has no credential yet. Sign in once interactively, or push once with `-c credential.helper=` + a token in `http.extraHeader`.
 
 ---
 
